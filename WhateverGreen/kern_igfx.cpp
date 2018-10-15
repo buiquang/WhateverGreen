@@ -12,6 +12,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
 #include <Headers/kern_file.hpp>
+#include <Headers/kern_iokit.hpp>
 
 static const char *pathIntelHD3000[]  { "/System/Library/Extensions/AppleIntelHD3000Graphics.kext/Contents/MacOS/AppleIntelHD3000Graphics" };
 static const char *pathIntelSNBFb[]   { "/System/Library/Extensions/AppleIntelSNBGraphicsFB.kext/Contents/MacOS/AppleIntelSNBGraphicsFB" };
@@ -198,6 +199,18 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		KernelPatcher::RouteRequest request("__ZN9IOService20copyExistingServicesEP12OSDictionaryjj", wrapCopyExistingServices, orgCopyExistingServices);
 		patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
 	}
+	
+	// Enable CFL backlight patch if CPU gen is CFL and model is laptop
+	cflBacklightPatch = (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake && WIOKit::getComputerModel() == WIOKit::ComputerModel::ComputerLaptop);
+	cflBacklightPatch = cflBacklightPatch || (info->videoBuiltin && info->videoBuiltin->getProperty("enable-cflbklt"));
+	
+	char igfxcflbklt[128];
+	if (PE_parse_boot_argn("igfxcflbklt", igfxcflbklt, sizeof(igfxcflbklt))) {
+		if (strstr(igfxcflbklt, "none"))
+			cflBacklightPatch = false;
+		else if (strstr(igfxcflbklt, "force"))
+			cflBacklightPatch = true;
+	}
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -230,7 +243,8 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 
 	if ((currentFramebuffer && currentFramebuffer->loadIndex == index) ||
 		(currentFramebufferOpt && currentFramebufferOpt->loadIndex == index)) {
-		if (currentFramebuffer == &kextIntelCFLFb && checkKernelArgument("-cflbkltfix")) {
+		if (currentFramebuffer == &kextIntelCFLFb && cflBacklightPatch) {
+			// The following function wrappers are required for the CFL backlight patch
 			orgReadRegister32 = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController14ReadRegister32Em", address, size);
 			orgWriteRegister32 = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController15WriteRegister32Emj", address, size);
 			
@@ -415,6 +429,7 @@ size_t IGFX::wrapHwSetPanelPowerConfig(void *that, uint32_t arg0) {
 	
 	callbackIGFX->backlightFrequency = static_cast<uint32_t>(bxt_blc_pwm_freq1);
 	
+	// This is the location of the backlight frequency. We need to store the initial value here to avoid black screen in CFL
 	uint32_t *p_fbc_pwm_freq = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(that) + 0x2b44);
 
 	if (bxt_blc_pwm_freq1)
@@ -424,7 +439,7 @@ size_t IGFX::wrapHwSetPanelPowerConfig(void *that, uint32_t arg0) {
 }
 
 uint64_t IGFX::wrapHwSetBacklight(void *that, uint32_t arg0) {
-	// hwSetBacklight we call our own routine here and skip calling the original function to avoid flicker
+	// hwSetBacklight use our backlight calculation here and skip call to original function to avoid flicker
 	//uint64_t r = FunctionCast(wrapHwSetBacklight, callbackIGFX->orgHwSetBacklight)(that, arg0);
 
 	callbackIGFX->backlightLevel = arg0;
@@ -433,6 +448,7 @@ uint64_t IGFX::wrapHwSetBacklight(void *that, uint32_t arg0) {
 	uint64_t bxt_blc_pwm_freq1 = reinterpret_cast<uint64_t(*)(void*, uint64_t)>(callbackIGFX->orgReadRegister32)(that, BXT_BLC_PWM_FREQ1);
 	uint64_t bxt_blc_pwm_duty1 = reinterpret_cast<uint64_t(*)(void*, uint64_t)>(callbackIGFX->orgReadRegister32)(that, BXT_BLC_PWM_DUTY1);
 	
+	// Calculate backlight duty in 64-bits so result is not truncated (essentially CFL backlight fix)
 	bxt_blc_pwm_freq1 = callbackIGFX->backlightFrequency;
 	bxt_blc_pwm_duty1 = static_cast<uint64_t>(callbackIGFX->backlightLevel) * bxt_blc_pwm_freq1 / 0xFFFFLL;
 	
@@ -445,7 +461,8 @@ uint64_t IGFX::wrapHwSetBacklight(void *that, uint32_t arg0) {
 }
 
 uint64_t IGFX::wrapSetAttributeForConnection(void *that, uint32_t arg0, uint32_t arg1, uint64_t arg2) {
-	// setAttributeForConnection appears to be called from several places
+	// setAttributeForConnection appears to be called from several places and will cause black screen bug in CFL if
+	// backlight registers are not set using 64-bit duty calculation to avoid truncation
 	
 	uint64_t r = FunctionCast(wrapSetAttributeForConnection, callbackIGFX->orgSetAttributeForConnection)(that, arg0, arg1, arg2);
 	
@@ -455,6 +472,7 @@ uint64_t IGFX::wrapSetAttributeForConnection(void *that, uint32_t arg0, uint32_t
 	reinterpret_cast<uint64_t(*)(void*, void*, uint64_t)>(callbackIGFX->orgDisplayReadRegister32)(that, &bxt_blc_pwm_freq1, BXT_BLC_PWM_FREQ1);
 	reinterpret_cast<uint64_t(*)(void*, void*, uint64_t)>(callbackIGFX->orgDisplayReadRegister32)(that, &bxt_blc_pwm_duty1, BXT_BLC_PWM_DUTY1);
 	
+	// Calculate backlight duty in 64-bits so result is not truncated (essentially CFL backlight fix)
 	bxt_blc_pwm_freq1 = callbackIGFX->backlightFrequency;
 	bxt_blc_pwm_duty1 = static_cast<uint64_t>(callbackIGFX->backlightLevel) * bxt_blc_pwm_freq1 / 0xFFFFLL;
 	
